@@ -65,7 +65,7 @@ universal_utctime = asn1.Tag(
     asn1.Classes.Universal)
 
 # 0, 32, 128
-context_any = asn1.Tag(
+context_any0 = asn1.Tag(
     0,
     asn1.Types.Constructed,
     asn1.Classes.Context)
@@ -84,7 +84,6 @@ SPC_HASH_INFO_OBJID = x509.ObjectIdentifier('1.3.6.1.4.1.311.2.1.29')
 SigFormatDescriptorV1_OID = x509.ObjectIdentifier('1.3.6.1.4.1.311.2.1.31')
 
 SpcIndirectDataContent_OID = '1.3.6.1.4.1.311.2.1.4'
-SpcIndirectDataContentV2_OID = '1.3.6.1.4.1.311.2.1.4'
 
 def get_decoder(decoder, data):
     if decoder:
@@ -107,14 +106,13 @@ def current_buffer(decoder):
     current_frame = decoder.m_stack[-1]
     return current_frame[1][current_frame[0]-1:]
 
-# This abuses the internal implementation of module asn1. FIXME.
 def read_raw(decoder):
-    current_frame = decoder.m_stack[-1]
-    pos = current_frame[0]
     tag, val = decoder.read()
-    new_pos = current_frame[0]
-    length = len(val) + new_pos - pos
-    return tag, current_frame[1][pos-1:pos+length]
+    encoder = asn1.Encoder()
+    encoder.start()
+    encoder.write(val, nr=tag.nr, typ=tag.typ, cls=tag.cls)
+    return tag, encoder.output()
+    
 
 oidnames = {
     '1.2.840.113549.1.7.2': 'SignedData',
@@ -155,7 +153,7 @@ class ASN1Error(Exception):
 def SequenceOf(cls, decoder=None, data=None):
     obj = []
     decoder = get_decoder(decoder, data)
-    logger.debug("SequenceOf %s: %d bytes" % (cls, current_length(decoder)))
+    logger.debug("SequenceOf %s: %d bytes pending" % (cls, current_length(decoder)))
 
     tag = decoder.peek()
     if tag != universal_sequence:
@@ -175,7 +173,7 @@ def SetOf(cls, decoder=None, data=None, expect=None):
         expect = universal_set 
     obj = set()
     decoder = get_decoder(decoder, data)
-    logger.debug("SetOf %s: %d bytes" % (cls, current_length(decoder)))
+    logger.error("SetOf %s: %d bytes pending" % (cls, current_length(decoder)))
 
     tag = decoder.peek()
     if tag != expect:
@@ -219,7 +217,7 @@ class SpcIndirectDataContent:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.warn("SpcIndirectDataContent: %d bytes" % current_length(decoder))
+        logger.warn("SpcIndirectDataContent: %d bytes pending" % current_length(decoder))
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -239,15 +237,6 @@ class SpcIndirectDataContent:
 
         return obj
 
-# SpcIndirectDataContentV2 ::= SEQUENCE {
-#     data               SpcAttributeTypeAndOptionalValue,
-#     messageDigest      DigestInfo
-# }
-
-class SpcIndirectDataContentV2(SpcIndirectDataContent):
-    pass
-
-
 # SpcAttributeTypeAndOptionalValue ::= SEQUENCE {
 #     type                OBJECT IDENTIFIER,
 #     value               [0] EXPLICIT ANY OPTIONAL
@@ -263,7 +252,7 @@ class SpcAttributeTypeAndOptionalValue:
         obj = cls()
         decoder = get_decoder(decoder, data)
 
-        logger.debug("SpcAttributeTypeAndOptionalValue: %d bytes" % current_length(decoder))
+        logger.debug("SpcAttributeTypeAndOptionalValue: %d bytes pending" % current_length(decoder))
         tag = decoder.peek()
         if tag != universal_sequence:
             raise ASN1Error({'expected': universal_sequence, 'found': tag})
@@ -446,19 +435,19 @@ class Name:
         rdns = []
 
         logger.debug(tag)
-        logger.debug("Name: %s (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+        logger.debug("Name: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
 
         decoder.enter()
         seq_tag = decoder.peek()
         while seq_tag:
             logger.debug(seq_tag)
-            logger.debug("Name one RDN: %s (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+            logger.debug("Name one RDN: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
             rdn = set()
             decoder.enter()
             set_tag = decoder.peek()
             while set_tag:
                 logger.debug(set_tag)
-                logger.debug("Name one RDN element: %s (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+                logger.debug("Name one RDN element: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
                 decoder.enter()
                 tag, val = decoder.read()
                 if tag != universal_oid:
@@ -495,7 +484,7 @@ class AttributeTypeAndValue:
     def parse(cls, decoder=None, data=None):
         decoder = get_decoder(decoder, data)
 
-        logger.debug("AttributeTypeAndValue: %d bytes" % current_length(decoder))
+        logger.debug("AttributeTypeAndValue: %d bytes pending" % current_length(decoder))
         tag = decoder.peek()
         if tag != universal_sequence:
             raise ASN1Error({'expected': universal_sequence, 'found': tag})
@@ -556,7 +545,7 @@ class DigestAlgorithms:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("DigestAlgorithms: %d bytes" % current_length(decoder))
+        logger.debug("DigestAlgorithms: %d bytes pending" % current_length(decoder))
 
         decoder.enter()
         tag = decoder.peek()
@@ -577,7 +566,7 @@ class Attribute:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("Attribute: %s (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+        logger.debug("Attribute: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -611,7 +600,7 @@ class Attributes:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("Attributes: %s (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+        logger.debug("Attributes: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
 
         obj.attributes = set()
 
@@ -623,7 +612,6 @@ class Attributes:
         decoder.leave()
 
         return obj
-
 
 # 6.6 ExtendedCertificatesAndCertificates
 # ExtendedCertificatesAndCertificates ::=
@@ -652,49 +640,24 @@ class ExtendedCertificateOrCertificate:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("ExtendedCertificateOrCertificate: %d bytes" % current_length(decoder))
+        logger.debug("ExtendedCertificateOrCertificate: %d bytes pending" % current_length(decoder))
 
         tag = decoder.peek()
-        if tag == context_any:
+        logger.debug("Found tag %s" % str(tag))
+        if tag == context_any0:
             # TBC: Unclear, unused in our examples
             cert = ExtendedCertificate.parse()
-            self.extendedCertificate = cert
+            obj.extendedCertificate = cert
         else:
             # We can't use decoder.read(), we need the raw data
-            # It is a hack, maybe hard to mainatain, Maybe propose
+            # It is a hack, maybe hard to maintain, Maybe propose
             # upstream
             tag, val = read_raw(decoder)
+            logger.error("Cert. len=%d, val=%s" % (len(val), hexlify(val)))
             cert = x509.load_der_x509_certificate(val, backend=cryptography_backend)
             logger.debug(cert.subject)
             obj.certificate = cert
         return cert
-
-        if tag != context_any:
-            raise ASN1Error({'expected': context_any, 'found': tag})
-
-        # We enter the IMPLICIT SET
-        obj.certificates = set()
-        decoder.enter()
-
-        # It is IMPLICIT, so no set tag
-        # TBC: IMPLICIT is in the enclosing structure, what if
-        # this is used without IMPLICIT elsewhere?
-        tag = decoder.peek()
-        while tag:
-            if tag == context_any:
-                # TBC: Unclear, not seen in our examples
-                cert = ExtendedCertificate.parse()
-            else:
-                # We can't use decoder.read(), we need the raw data
-                # It is a hack, maybe hard to mainain
-                tag, val = read_raw(decoder)
-                cert = x509.load_der_x509_certificate(val, backend=cryptography_backend)
-                logger.debug(cert.subject)
-                obj.certificates.add(cert)
-
-            tag = decoder.peek()
-            
-        decoder.leave()
 
 # SignerInfos ::= SET OF SignerInfo
 
@@ -754,7 +717,7 @@ class ContentInfo:
         obj = cls()
         decoder = get_decoder(decoder, data)
 
-        logger.info("ContentInfo: %d bytes" % current_length(decoder))
+        logger.info("ContentInfo: %d bytes pending" % current_length(decoder))
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -772,20 +735,21 @@ class ContentInfo:
 
         # elif tag == universal_sequence:
         tag = decoder.peek()
-        if tag != context_any:
-            raise ASN1Error({'expected': context_any, 'found': tag})
+        if tag != context_any0:
+            raise ASN1Error({'expected': context_any0, 'found': tag})
 
         decoder.enter()
         if oid == Data_OID:
             tag, val = decoder.read()
             if tag != normal_octetstring:
                 raise ASN1Error({'expected': normal_octetstring, 'found': tag})
-            obj.Data = val
+            obj.content = val
             
         elif oid == SignedData_OID:
-            obj.signedData = SignedData.parse(decoder)
+            obj.content = SignedData.parse(decoder)
 
         elif oid == SPC_INDIRECT_DATA_OBJID:
+            
             # Apparently Microsoft uses the same OID for both
             # May be SpcIndirectDataContent or SpcIndirectDataContentV2
             # But we don't know which
@@ -801,15 +765,8 @@ class ContentInfo:
             # else:
             #    raise ValueError
 
-            obj.spcIndirectDataContent = SpcIndirectDataContent.parse(decoder)
+            obj.content = SpcIndirectDataContent.parse(decoder)
             
-
-        elif oid == SpcIndirectDataContent_OID:
-            obj.spcIndirectDataContent = SpcIndirectDataContent.parse(decoder)
-
-        elif oid == SpcIndirectDataContentV2_OID:
-            obj.spcIndirectDataContentV2 = SpcIndirectDataContentV2.parse(decoder)
-
         else:
             raise ValueError("Content %s is unsupported" % oid)
         decoder.leave()
@@ -849,7 +806,7 @@ class SignedData:
         obj = cls()
         decoder = get_decoder(decoder, data)
 
-        logger.info("SignedData: %d bytes" % current_length(decoder))
+        logger.info("SignedData: %d bytes pending" % current_length(decoder))
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -875,7 +832,7 @@ class SignedData:
         obj.contentInfo = ContentInfo.parse(decoder)
 
         tag = decoder.peek()
-        if tag == context_any:
+        if tag == context_any0:
             obj.certificates = ExtendedCertificatesAndCertificates.parse(decoder, expect=tag)
         else:
             obj.certificates = None
@@ -933,7 +890,7 @@ class SignerInfo:
         obj.issuerAndSerialNumber = IssuerAndSerialNumber.parse(decoder)
         obj.digestAlgorithm = DigestAlgorithmIdentifier.parse(decoder)
         tag = decoder.peek()
-        if tag == context_any:
+        if tag == context_any0:
             obj.authenticatedAttributes = Attributes.parse(decoder)
         else:
             obj.authenticatedAttributes = None
@@ -965,7 +922,7 @@ class DigestInfo:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("DigestInfo: %d bytes" % current_length(decoder))
+        logger.debug("DigestInfo: %d bytes pending" % current_length(decoder))
 
         tag = decoder.peek()
         if tag != universal_sequence:
