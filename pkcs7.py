@@ -11,7 +11,6 @@ from struct import unpack
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 cryptography_backend = default_backend()
 
@@ -89,30 +88,31 @@ def get_decoder(decoder, data):
     if decoder:
         return decoder
     if data:
-        decoder = asn1.Decoder()
+        decoder = MyDecoder()
         decoder.start(data)
         return decoder
     else:
         raise ValueError("No data")
 
-# This abuses the internal implementation of module asn1. FIXME.
-def current_length(decoder, adjust=0):
-    current_frame = decoder.m_stack[-1]
-    # return len(current_frame[1]) - current_frame[0]
-    return len(current_frame[1]) - adjust
+class MyDecoder(asn1.Decoder):
 
-# This abuses the internal implementation of module asn1. FIXME.
-def current_buffer(decoder):
-    current_frame = decoder.m_stack[-1]
-    return current_frame[1][current_frame[0]-1:]
+    # This abuses the internal implementation of module asn1. FIXME.
+    def current_length(self, adjust=0):
+        current_frame = self.m_stack[-1]
+        # return len(current_frame[1]) - current_frame[0]
+        return len(current_frame[1]) - adjust
 
-def read_raw(decoder):
-    tag, val = decoder.read()
-    encoder = asn1.Encoder()
-    encoder.start()
-    encoder.write(val, nr=tag.nr, typ=tag.typ, cls=tag.cls)
-    return tag, encoder.output()
-    
+    # This abuses the internal implementation of module asn1. FIXME.
+    def current_buffer(self):
+        current_frame = self.m_stack[-1]
+        return current_frame[1][current_frame[0]-1:]
+
+    def read_raw(self):
+        tag, val = self.read()
+        encoder = asn1.Encoder()
+        encoder.start()
+        encoder.write(val, nr=tag.nr, typ=tag.typ, cls=tag.cls)
+        return tag, encoder.output()
 
 oidnames = {
     '1.2.840.113549.1.7.2': 'SignedData',
@@ -153,7 +153,7 @@ class ASN1Error(Exception):
 def SequenceOf(cls, decoder=None, data=None):
     obj = []
     decoder = get_decoder(decoder, data)
-    logger.debug("SequenceOf %s: %d bytes pending" % (cls, current_length(decoder)))
+    logger.debug("SequenceOf %s: %d bytes pending" % (cls, decoder.current_length()))
 
     tag = decoder.peek()
     if tag != universal_sequence:
@@ -173,7 +173,7 @@ def SetOf(cls, decoder=None, data=None, expect=None):
         expect = universal_set 
     obj = set()
     decoder = get_decoder(decoder, data)
-    logger.error("SetOf %s: %d bytes pending" % (cls, current_length(decoder)))
+    logger.debug("SetOf %s: %d bytes pending" % (cls, decoder.current_length()))
 
     tag = decoder.peek()
     if tag != expect:
@@ -217,7 +217,7 @@ class SpcIndirectDataContent:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.warn("SpcIndirectDataContent: %d bytes pending" % current_length(decoder))
+        logger.debug("SpcIndirectDataContent: %d bytes pending" % decoder.current_length())
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -252,7 +252,7 @@ class SpcAttributeTypeAndOptionalValue:
         obj = cls()
         decoder = get_decoder(decoder, data)
 
-        logger.debug("SpcAttributeTypeAndOptionalValue: %d bytes pending" % current_length(decoder))
+        logger.debug("SpcAttributeTypeAndOptionalValue: %d bytes pending" % decoder.current_length())
         tag = decoder.peek()
         if tag != universal_sequence:
             raise ASN1Error({'expected': universal_sequence, 'found': tag})
@@ -358,6 +358,7 @@ class SigDataV1Serialized:
         obj = cls()
 
         if data:
+            logger.debug("SigDataV1Serialized: (%d): %s" % (len(data), hexlify(data)))
             # Another one that is supposedly DER, but isn't
             (obj.algorithmIdSize,
              obj.compiledHashSize,
@@ -370,6 +371,8 @@ class SigDataV1Serialized:
             if total_length != len(data):
                 raise ValueError("Length of SigDataV1Serialized should be %d, but the buffer is %d" % (total_length, len(data)))
 
+            if obj.sourceHashOffset + obj.sourceHashSize != len(data):
+                raise ValueError("sourceHash is not at the end")
             # And don't miss this, the digest algorithm OID as a null
             # terminated ASCII string!!!
             algorithmId = data[obj.algorithmIdOffset:obj.algorithmIdOffset+obj.algorithmIdSize]
@@ -435,19 +438,19 @@ class Name:
         rdns = []
 
         logger.debug(tag)
-        logger.debug("Name: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+        logger.debug("Name: %s pending (%s)" % (decoder.current_length(), hexlify(decoder.current_buffer()[:32])))
 
         decoder.enter()
         seq_tag = decoder.peek()
         while seq_tag:
             logger.debug(seq_tag)
-            logger.debug("Name one RDN: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+            logger.debug("Name one RDN: %s pending (%s)" % (decoder.current_length(), hexlify(decoder.current_buffer()[:32])))
             rdn = set()
             decoder.enter()
             set_tag = decoder.peek()
             while set_tag:
                 logger.debug(set_tag)
-                logger.debug("Name one RDN element: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+                logger.debug("Name one RDN element: %s pending (%s)" % (decoder.current_length(), hexlify(decoder.current_buffer()[:32])))
                 decoder.enter()
                 tag, val = decoder.read()
                 if tag != universal_oid:
@@ -484,7 +487,7 @@ class AttributeTypeAndValue:
     def parse(cls, decoder=None, data=None):
         decoder = get_decoder(decoder, data)
 
-        logger.debug("AttributeTypeAndValue: %d bytes pending" % current_length(decoder))
+        logger.debug("AttributeTypeAndValue: %d bytes pending" % decoder.current_length())
         tag = decoder.peek()
         if tag != universal_sequence:
             raise ASN1Error({'expected': universal_sequence, 'found': tag})
@@ -545,7 +548,7 @@ class DigestAlgorithms:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("DigestAlgorithms: %d bytes pending" % current_length(decoder))
+        logger.debug("DigestAlgorithms: %d bytes pending" % decoder.current_length())
 
         decoder.enter()
         tag = decoder.peek()
@@ -566,7 +569,7 @@ class Attribute:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("Attribute: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+        logger.debug("Attribute: %s pending (%s)" % (decoder.current_length(), hexlify(decoder.current_buffer()[:32])))
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -600,7 +603,7 @@ class Attributes:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("Attributes: %s pending (%s)" % (current_length(decoder), hexlify(current_buffer(decoder)[:32])))
+        logger.debug("Attributes: %s pending (%s)" % (decoder.current_length(), hexlify(decoder.current_buffer()[:32])))
 
         obj.attributes = set()
 
@@ -624,7 +627,7 @@ class ExtendedCertificatesAndCertificates:
         decoder = get_decoder(decoder, data)
         if not expect:
             expect = universal_set
-        print("Expect = %s" % str(expect))
+        logger.debug("Expect = %s" % str(expect))
         tag = decoder.peek()
         if tag != expect:
             raise ASN1Error({'expected': expect, 'found': tag})
@@ -640,7 +643,7 @@ class ExtendedCertificateOrCertificate:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("ExtendedCertificateOrCertificate: %d bytes pending" % current_length(decoder))
+        logger.debug("ExtendedCertificateOrCertificate: %d bytes pending" % decoder.current_length())
 
         tag = decoder.peek()
         logger.debug("Found tag %s" % str(tag))
@@ -652,8 +655,8 @@ class ExtendedCertificateOrCertificate:
             # We can't use decoder.read(), we need the raw data
             # It is a hack, maybe hard to maintain, Maybe propose
             # upstream
-            tag, val = read_raw(decoder)
-            logger.error("Cert. len=%d, val=%s" % (len(val), hexlify(val)))
+            tag, val = decoder.read_raw()
+            logger.debug("Cert. len=%d, val=%s" % (len(val), hexlify(val)))
             cert = x509.load_der_x509_certificate(val, backend=cryptography_backend)
             logger.debug(cert.subject)
             obj.certificate = cert
@@ -717,7 +720,7 @@ class ContentInfo:
         obj = cls()
         decoder = get_decoder(decoder, data)
 
-        logger.info("ContentInfo: %d bytes pending" % current_length(decoder))
+        logger.info("ContentInfo: %d bytes pending" % decoder.current_length())
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -806,7 +809,7 @@ class SignedData:
         obj = cls()
         decoder = get_decoder(decoder, data)
 
-        logger.info("SignedData: %d bytes pending" % current_length(decoder))
+        logger.info("SignedData: %d bytes pending" % decoder.current_length())
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -922,7 +925,7 @@ class DigestInfo:
     def parse(cls, decoder=None, data=None):
         obj = cls()
         decoder = get_decoder(decoder, data)
-        logger.debug("DigestInfo: %d bytes pending" % current_length(decoder))
+        logger.debug("DigestInfo: %d bytes pending" % decoder.current_length())
 
         tag = decoder.peek()
         if tag != universal_sequence:
@@ -937,8 +940,8 @@ class DigestInfo:
         return obj
 
     def zoom_in(self, cls):
-        logger.warning(cls)
-        logger.warning(hexlify(self.digest))
+        logger.debug(cls)
+        logger.debug(hexlify(self.digest))
         digest_parsed = cls.parse(data=self.digest)
-        logger.warning(digest_parsed)
+        logger.debug(digest_parsed)
         self.digest_parsed = digest_parsed
