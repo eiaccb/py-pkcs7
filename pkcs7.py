@@ -18,13 +18,10 @@ import hashlib
 import asn1
 from cryptography import x509
 from cryptography.x509.oid import NameOID
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 from cryptography.hazmat.primitives import serialization
-
-cryptography_backend = default_backend()
 
 # 16, 32, 0
 universal_sequence = asn1.Tag(
@@ -234,22 +231,25 @@ def load_certificate(path):
         cert = x509.load_der_x509_certificate(certificate_bytes)
     return cert
 
-class SignEngine():
+class SignerEngine():
 
     def sign(self, data):
         raise NotImplementedError("Missing sign implemantarion")
     
-class PrivateKeySignEngine(SignEngine):
+class PrivateKeySignerEngine(SignerEngine):
 
     def __init__(self, path, password=None):
         data = open(path, 'rb').read()
         self.private_key = serialization.load_pem_private_key(data, password)
 
     def sign(self, data, padding=padding.PKCS1v15(), algorithm=Prehashed):
-        print(data)
-        result = self.private_key.sign(data, padding, hashes.SHA256())
+        logger.debug(data)
+        result = self.private_key.sign(data, padding, algorithm)
         return result
-        
+
+# TODO: The following classes are not generic enough.
+# Possibly move them elsewhere
+
 # SpcIndirectDataContent ::= SEQUENCE {
 #     data               SpcAttributeTypeAndOptionalValue,
 #     messageDigest      DigestInfo
@@ -451,6 +451,15 @@ class SigDataV1Serialized:
 
         decoder.leave()
 
+class ASN1Data:
+
+    def as_der_bytes(self):
+        encoder = asn1.Encoder()
+        encoder.start()
+        self.asn1_serialize(encoder)
+        return encoder.output()
+
+
 # Defined in X.509
 
 # Name            ::=   CHOICE { -- only one possibility for now --
@@ -516,7 +525,7 @@ class Name:
         logger.debug(name.rfc4514_string())
         return name
 
-    def serialize(self, encoder):
+    def asn1_serialize(self, encoder):
         name_der__bytes = self.public_bytes()
         encoder.enter(asn1.Numbers.Sequence)
         encoder.write(peel(name_der_bytes)[1], asn1.Numbers.Sequence. asn1.TYpes.Constructed)
@@ -600,12 +609,15 @@ class AlgorithmIdentifier:
         if parameters:
             raise NotImplementedError("Parameters on algorithms is not supported yet")
 
-        obj.algorithm = x509.ObjectIdentifier(oid)
+        if isinstance(oid, x509.ObjectIdentifier):
+            obj.algorithm = oid
+        else:
+            obj.algorithm = x509.ObjectIdentifier(oid)
         obj.parameters = None
 
         return obj
 
-    def serialize(self, encoder):
+    def asn1_serialize(self, encoder):
         encoder.enter(asn1.Numbers.Sequence)
         encoder.write(self.algorithm.dotted_string, asn1.Numbers.ObjectIdentifier)
         # parameters not suported yet
@@ -662,6 +674,29 @@ class DigestAlgorithms:
 
         return obj
 
+# From PKCS #9, 5.3 Attribute types to be used in PKCS #7 data
+# We define here a couple of classes to hold values for the
+# contentType and messageDigest Attributes 
+class PKCS9_ContentType:
+    def __init__(self, value):
+        if isinstance(value, x509.ObjectIdentifier):
+            self.oid = value
+        else:
+            self.oid = x509.ObjectIdentifier(value)
+
+    def asn1_serialize(self, encoder):
+        encoder.write(self.oid.dotted_string, asn1.Numbers.ObjectIdentifier)
+
+class PKCS9_MessageDigest:
+    def __init__(self, value):
+        if isinstance(value, (str, bytes)):
+            self.messageDigest = value
+        else:
+            self.messageDigest = value.digest
+
+    def asn1_serialize(self, encoder):
+        encoder.write(self.messageDigest, asn1.Numbers.OctetString)
+        
 # Attribute       ::=     SEQUENCE {
 #   type            AttributeType,
 #   values  SET OF AttributeValue
@@ -700,7 +735,32 @@ class Attribute:
 
         decoder.leave()
 
+    @classmethod
+    def build(cls, typ, values):
+        obj = cls()
+        obj.type = typ
+        obj.values = values
+        return obj
+
+    def asn1_serialize(self, encoder):
+        encoder.enter(asn1.Numbers.Sequence)
+        encoder.write(self.type.dotted_string, asn1.Numbers.ObjectIdentifier)
+        encoder.enter(asn1.Numbers.Set)
+        for v in self.values:
+            try:
+                v.asn1_serialize(encoder)
+            except (AssertionError, AttributeError, TypeError):
+                logger.error("Problem serializing {}".format(v))
+                raise
+        encoder.leave()
+        encoder.leave()
+
 class Attributes:
+
+    def __init__(self):
+        # Actually should be a set, we use a list to simplify debugging
+        # by comparison with samples
+        self.attributes = []
 
     @classmethod
     def parse(cls, decoder=None, data=None):
@@ -708,16 +768,27 @@ class Attributes:
         decoder = get_decoder(decoder, data)
         logger.debug("Attributes: %s pending (%s)" % (decoder.current_length(), hexlify(decoder.current_buffer()[:32])))
 
-        obj.attributes = set()
-
         decoder.enter()
         tag = decoder.peek()
         while tag:
-            obj.attributes.add(Attribute.parse(decoder))
+            obj.attributes.append(Attribute.parse(decoder))
             tag = decoder.peek()
         decoder.leave()
 
         return obj
+
+    def add_attribute(self, attribute):
+        if not attribute in self.attributes:
+            self.attributes.append(attribute)
+
+    def asn1_serialize(self, encoder, tag=None):
+        if tag is None:
+            encoder.enter(asn1.Numbers.Set)
+        else:
+            encoder.enter(tag, asn1.Classes.Context)
+        for attribute in self.attributes:
+            attribute.asn1_serialize(encoder)
+        encoder.leave()
 
 # 6.6 ExtendedCertificatesAndCertificates
 # ExtendedCertificatesAndCertificates ::=
@@ -760,7 +831,7 @@ class ExtendedCertificateOrCertificate:
             # upstream
             tag, val = decoder.read_raw()
             logger.debug("Cert. len=%d, val=%s" % (len(val), hexlify(val)))
-            cert = x509.load_der_x509_certificate(val, backend=cryptography_backend)
+            cert = x509.load_der_x509_certificate(val)
             logger.debug(cert.subject)
             obj.certificate = cert
         return cert
@@ -811,10 +882,10 @@ class IssuerAndSerialNumber:
 
         return obj
 
-    def serialize(self, encoder):
+    def asn1_serialize(self, encoder):
         encoder.enter(asn1.Numbers.Sequence)
         # Problema. Self.issuer es un x509Name, no podemos usar:
-        # self.issuer.serialize(encoder)
+        # self.issuer.asn1_serialize(encoder)
 
         issuer_der_bytes = self.issuer.public_bytes()
         encoder.write(peel(issuer_der_bytes)[1], asn1.Numbers.Sequence, asn1.Types.Constructed)
@@ -831,6 +902,10 @@ class IssuerAndSerialNumber:
 # ContentType ::= OBJECT IDENTIFIER
 
 class ContentInfo:
+
+    def __init__(self, contentType=None, content=None):
+        self.contentType = contentType
+        self.content = content
 
     def __str__(self):
         if self.contentType.dotted_string == SignedData_OID:
@@ -918,11 +993,21 @@ class ContentInfo:
     # TBC: lo de funcionar o no, mejor con una función superior que
     # que encapsule cualquier función. Todas estas clases las haríamos hijas
     # de la superclase en la que definiríamos el recubirmiento. O así.
-    def serialize(self, encoder):
+    def asn1_serialize(self, encoder):
         encoder.enter(asn1.Numbers.Sequence)
         encoder.write(self.contentType.dotted_string, asn1.Numbers.ObjectIdentifier)
         encoder.enter(0, asn1.Classes.Context)
-        encoder.write(self.content, asn1.Numbers.OctetString)
+
+        logger.debug("contentType is {}".format(self.contentType))
+        logger.debug("content is {}".format(hexlify(self.content)))
+        # We did this for files, where the info should be coded
+        # as OctetString, but it may be any ASN.1 structure
+        # self.content is bytes, but should not be coded as an Octet Strincg
+        # We meed to output it raw
+        decoder = asn1.Decoder()
+        decoder.start(self.content)
+        tag, value = decoder.read()
+        encoder.write(value=value, nr=tag.nr, typ=tag.typ, cls=tag.cls)
         encoder.leave()
         encoder.leave()
         return
@@ -1004,6 +1089,7 @@ class SignedData:
     @classmethod
     def build(cls,
               content_info=None,
+              authenticated_attributes=None,
               signer_infos=[],
               certificates=[]):
 
@@ -1012,6 +1098,7 @@ class SignedData:
         obj.version = 1
         obj.digestAlgorithms = set()
         obj.contentInfo = content_info
+        obj.authenticated_attributes = authenticated_attributes
         obj.certificates = certificates
         obj.signerInfos = signer_infos
 
@@ -1021,20 +1108,20 @@ class SignedData:
         
         return obj
        
-    def serialize(self, encoder):
+    def asn1_serialize(self, encoder):
         encoder.enter(asn1.Numbers.Sequence)
         encoder.write(1)	# version
         encoder.enter(asn1.Numbers.Set)
         for algorithm in self.digestAlgorithms:
-            algorithm.serialize(encoder)
+            algorithm.asn1_serialize(encoder)
         encoder.leave()
-        self.contentInfo.serialize(encoder)
+        self.contentInfo.asn1_serialize(encoder)
         if self.certificates and len(self.certificates):
             # We could do this like the rest.
             encoder.enter(0, asn1.Classes.Context)
             for certificate in self.certificates:
                 v = peel(certificate.public_bytes(serialization.Encoding.DER))[1]
-                print(type(v))
+                logger.debug(type(v))
                 encoder.write(v, asn1.Numbers.Sequence, asn1.Types.Constructed)
             encoder.leave()
 
@@ -1043,7 +1130,7 @@ class SignedData:
 
         encoder.enter(asn1.Numbers.Set)
         for signer_info in self.signerInfos:
-            signer_info.serialize(encoder)
+            signer_info.asn1_serialize(encoder)
         encoder.leave()
         
         encoder.leave()
@@ -1113,7 +1200,7 @@ class SignerInfo:
               certificate,
               digestAlgorithm,
               digestEncryptionAlgorithm,
-              sign_engine,
+              signer_engine,
               content_info,
               authenticatedAttributes=None,
               unauthenticatedAttributes=None):
@@ -1125,34 +1212,53 @@ class SignerInfo:
         obj.digestAlgorithm = digestAlgorithm
         obj.digestEncryptionAlgorithm = digestEncryptionAlgorithm
         obj.contentInfo = content_info
-        obj.sign_engine = sign_engine
+        obj.signer_engine = signer_engine
         obj.encryptedDigest = None 
-        obj.authenticatedAttributes = None
-        obj.unauthenticatedAttributes = None
+        obj.authenticatedAttributes = authenticatedAttributes
+        obj.unauthenticatedAttributes = unauthenticatedAttributes
 
-        if obj.authenticatedAttributes and len(obj.authenticatedAttributes):
-            raise NotImplementedError('No support for authenticated attributes yet')
+        logger.debug(obj.contentInfo.contentType)
+        logger.debug(obj.contentInfo.content)
+        # First compute the value we need to sign
+        # !!!Wait, this is wrong!!! we need the full signature
+        # logger.error(self.digest)
+        if obj.authenticatedAttributes:
+            saa_encoder = asn1.Encoder()
+            saa_encoder.start()
+            # Attention here!!!
+            # See RRC 2315 9.3 Message-digesting process
+            # Even if authenticatedAttributes is defined as
+            # [0] IMPLICIT Attributes OPTIONAL
+            # section 9.3 mandates that it is hashed as what an Attributes
+            # type is, i.e. a SET. When the authenticated attributes are
+            # included in a SignerInfo, it needs to be tagged as [0]
+            # instead of SET. asn1_serialize knows the difference because
+            # here we will not set a value for the tag argument, so it will
+            # be serialized as a SET.
+            obj.authenticatedAttributes.asn1_serialize(saa_encoder)
+            serialized_authenticated_attributes = saa_encoder.output()
+            logger.error("SAA: {}".format(hexlify(serialized_authenticated_attributes)))
+            aa_encoder = asn1.Encoder()
+            aa_encoder.start()
+            obj.authenticatedAttributes.asn1_serialize(aa_encoder, tag=0)
+            aa = aa_encoder.output()
+            logger.error("AA: {}".format(hexlify(aa)))
+            obj.digest = obj.digestAlgorithm.compute(serialized_authenticated_attributes).digest()
         else:
-            logger.debug(obj.contentInfo.contentType)
-            logger.debug(obj.contentInfo.content)
             obj.digest = obj.digestAlgorithm.compute(obj.contentInfo.content).digest()
-        # We cannot compute this right now
+
         return obj
 
-    def serialize(self, encoder):
-        # First cumpute the value we need to sign
-        if self.authenticatedAttributes and len(self.authenticatedAttributes) > 0:
-            raise NotImplementedError
-        else:
-            # !!!Wait, this is wrong!!! we need the full signature
-            # logger.error(self.digest)
-            encryptedDigest = self.sign_engine.sign(self.digest)
+    def asn1_serialize(self, encoder):
+        encryptedDigest = self.signer_engine.sign(self.digest)
         encoder.enter(asn1.Numbers.Sequence)
         encoder.write(self.version)
-        self.issuerAndSerialNumber.serialize(encoder)
-        self.digestAlgorithm.serialize(encoder)
-        # TBC: authenticatedAttributes
-        self.digestEncryptionAlgorithm.serialize(encoder)
+        self.issuerAndSerialNumber.asn1_serialize(encoder)
+        self.digestAlgorithm.asn1_serialize(encoder)
+        # Here we instruct asn1_serialize to encode it as a
+        # [0] instead of a SET
+        self.authenticatedAttributes.asn1_serialize(encoder, tag=0)
+        self.digestEncryptionAlgorithm.asn1_serialize(encoder)
         encoder.write(encryptedDigest, asn1.Numbers.OctetString)
         # TBC: unauthenticatedAtributes
         
@@ -1193,7 +1299,11 @@ class DigestInfo:
         logger.debug(digest_parsed)
         self.digest_parsed = digest_parsed
 
-class signedDataBuilder:
+    def asn1_serialize(self, encoder):
+        encoder.enter(asn1.Numbers.Sequence)
+        encoder.leave()
+            
+class SignedDataBuilder:
     def __init__(self):
         self._content_info = None
         self._signers = []
@@ -1206,17 +1316,30 @@ class signedDataBuilder:
         self._digest_encryption_algorithm = AlgorithmIdentifier.build('rsaEncryption')
         self._unauthenticated_attributes = set()
 
-        self._sign_engine = None
+        self._signer_engine = None
        
     def default_rsa_sign(self, private_key_file, password):
         private_key = load_private_key(private_key_file, password)
         
         return 
 
-    def add_CcontentInfo(self, content_type, content):
+    def add_contentInfo(self, contentInfo):
         '''Add content already prepared'''
+        self._content_info = contentInfo
+        return self
+
+    def add_content(self, contentType, content):
+        '''Add content already prepared'''
+        logger.debug("contentType is {}".format(contentType))
+        logger.debug("content is {}".format(hexlify(content)))
+        if contentType.dotted_string != Data_OID:
+            # TBC: Check that these requirements are met
+            if False:
+                raise ValueError("If the contentType is not data, a signedContentType is needed, see RFC2315 #9.1")
+            if False:
+                raise ValueError("If the contentType is not data, a messageDigest is needed, see RFC2315 #9.1")
         self._content_info = ContentInfo(
-            content_type=content_type,
+            contentType=contentType,
             content=content)
         return self
 
@@ -1233,30 +1356,22 @@ class signedDataBuilder:
         return self
 
     def add_digest_algorithm(self, algorithm):
-        digestAlgorithm = DigestAlgorithm(algorithm)
-        self._digest_algorithms.add(digestAlgorithm)
+        digestAlgorithm = DigestAlgorithmIdentifier.build(oid=algorithm)
+        self._digestAlgorithms.add(digestAlgorithm)
 
-    def add_private_key(self, private_key_file):
-        while True:
-            password = getpass.getpass('Contraseña para la clave privada: ')
-            if len(password):
-                password = password.encode('utf8')
-            else:
-                password = None
-            try:
-                self._sign_engine = PrivateKeySignEngine(private_key_file, password)
-                return
-            except TypeError:
-                sys.stderr.write('La clave privada está protegida por contraseña\n')
-            except ValueError:
-                sys.stderr.write('La contraseña es incorrecta\n')
-                continue
-        
     def add_certificate(self, certificate_path):
         cert = load_certificate(certificate_path)
         if not cert in self._extra_certificates:
             self._extra_certificates,append(cert)
 
+    def add_authenticated_attribute(self, oid, values):
+        if not self._authenticated_attributes:
+            self._authenticated_attributes = Attributes()
+        self._authenticated_attributes.add_attribute(Attribute.build(oid, values))
+
+    def set_signer_engine(self, signer_engine):
+        self._signer_engine = signer_engine
+        
     def output(self, format='PEM'):
         '''Return a serialized ContentInfo containing a SignedData'''
 
@@ -1265,19 +1380,22 @@ class signedDataBuilder:
 
         signerInfos = set()
         for signer in self._signers:
-            certificate = load_certificate(signer)
+            certificate = signer
             if not certificate in self._certificates:
                 self._certificates.append(certificate)
-            digestAlgorithm = self._default_digest_algorithm
+            if len (self._digestAlgorithms) > 0:
+                digestAlgorithm = list(self._digestAlgorithms)[0]
+            else:
+                digestAlgorithm = self._default_digest_algorithm
             authenticatedAttributes = self._authenticated_attributes
             digestEncryptionAlgorithm = self._digest_encryption_algorithm
             unauthenticatedAttributes = self._unauthenticated_attributes
-            sign_engine = self._sign_engine
+            signer_engine = self._signer_engine
             signerInfo = SignerInfo.build(
                 certificate,
                 digestAlgorithm=digestAlgorithm,
                 digestEncryptionAlgorithm=digestEncryptionAlgorithm,
-                sign_engine=sign_engine,
+                signer_engine=signer_engine,
                 content_info=self._content_info,
                 authenticatedAttributes=authenticatedAttributes,
                 unauthenticatedAttributes=unauthenticatedAttributes)
@@ -1292,9 +1410,10 @@ class signedDataBuilder:
         print(self._extra_certificates)
         signed_data = SignedData.build(
             content_info=self._content_info,
+            authenticated_attributes=self._authenticated_attributes,
             signer_infos=signerInfos,
             certificates=self._certificates + self._extra_certificates)
-        signed_data.serialize(encoder)
+        signed_data.asn1_serialize(encoder)
         encoder.leave()
         encoder.leave()
         result = encoder.output()
@@ -1320,7 +1439,7 @@ def main():
     
     args = parser.parse_args()
     if args.command == 'sign':
-        builder = signedDataBuilder()
+        builder = SignedDataBuilder()
         builder.add_content_file(
             args.filename
         )
