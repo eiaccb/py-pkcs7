@@ -453,10 +453,13 @@ class SigDataV1Serialized:
 
 class ASN1Data:
 
-    def as_der_bytes(self):
+    def as_der_bytes(self, implicit_tag=None):
         encoder = asn1.Encoder()
         encoder.start()
-        self.asn1_serialize(encoder)
+        if implicit_tag is not None:
+            self.asn1_serialize(encoder, implicit_tag=implicit_tag)
+        else:
+            self.asn1_serialize(encoder)
         return encoder.output()
 
 
@@ -571,6 +574,15 @@ class AttributeTypeAndValue:
 
 class AlgorithmIdentifier:
 
+    def __init__(self, algorithm=None, parameters=None):
+        try:
+            assert algorithm is None or isinstance(algorithm, x509.ObjectIdentifier)
+        except AssertionError:
+            logger.error("Invalid algorithm: {}".format(type(algorithm)))
+            raise
+        self.algorithm = algorithm
+        self.parameters = parameters
+
     def __str__(self):
         return "Algorithm %s (%s)" % (
             oid2name(self.algorithm.dotted_string),
@@ -645,7 +657,6 @@ class DigestAlgorithmIdentifier(AlgorithmIdentifier):
     def compute(self, data):
         oid = self.algorithm.dotted_string
         if oid in digest_algorithms_by_oid:
-            logger.debug(data)
             digest = digest_algorithms_by_oid[oid][2](data)
         else:
             raise NotImplementedError("No implementation for {}".format(oid))
@@ -755,7 +766,7 @@ class Attribute:
         encoder.leave()
         encoder.leave()
 
-class Attributes:
+class Attributes(ASN1Data):
 
     def __init__(self):
         # Actually should be a set, we use a list to simplify debugging
@@ -781,11 +792,11 @@ class Attributes:
         if not attribute in self.attributes:
             self.attributes.append(attribute)
 
-    def asn1_serialize(self, encoder, tag=None):
-        if tag is None:
+    def asn1_serialize(self, encoder, implicit_tag=None):
+        if implicit_tag is None:
             encoder.enter(asn1.Numbers.Set)
         else:
-            encoder.enter(tag, asn1.Classes.Context)
+            encoder.enter(implicit_tag, asn1.Classes.Context)
         for attribute in self.attributes:
             attribute.asn1_serialize(encoder)
         encoder.leave()
@@ -1223,8 +1234,6 @@ class SignerInfo:
         # !!!Wait, this is wrong!!! we need the full signature
         # logger.error(self.digest)
         if obj.authenticatedAttributes:
-            saa_encoder = asn1.Encoder()
-            saa_encoder.start()
             # Attention here!!!
             # See RRC 2315 9.3 Message-digesting process
             # Even if authenticatedAttributes is defined as
@@ -1232,32 +1241,33 @@ class SignerInfo:
             # section 9.3 mandates that it is hashed as what an Attributes
             # type is, i.e. a SET. When the authenticated attributes are
             # included in a SignerInfo, it needs to be tagged as [0]
-            # instead of SET. asn1_serialize knows the difference because
-            # here we will not set a value for the tag argument, so it will
-            # be serialized as a SET.
-            obj.authenticatedAttributes.asn1_serialize(saa_encoder)
-            serialized_authenticated_attributes = saa_encoder.output()
-            logger.error("SAA: {}".format(hexlify(serialized_authenticated_attributes)))
-            aa_encoder = asn1.Encoder()
-            aa_encoder.start()
-            obj.authenticatedAttributes.asn1_serialize(aa_encoder, tag=0)
-            aa = aa_encoder.output()
-            logger.error("AA: {}".format(hexlify(aa)))
+            # instead of SET. asn1_serialize (called by as_der_bytes) knows
+            # the difference from the value of the implicit_tag argument.
+            # We leave it out here, so that the default set encoding is
+            # used and the result starts with a 0x31 byte.
+            # Elsewhere, implicit_tag is set to 0 encoding it as an
+            # IMPLICIT [0] and the first byte becomes 0xA0.
+            # Other implementations serialize just once and modify the
+            # first byte as needed. We decided not to.
+            serialized_authenticated_attributes = obj.authenticatedAttributes.as_der_bytes()
+            logger.debug("SAA: {}".format(hexlify(serialized_authenticated_attributes)))
             obj.digest = obj.digestAlgorithm.compute(serialized_authenticated_attributes).digest()
         else:
             obj.digest = obj.digestAlgorithm.compute(obj.contentInfo.content).digest()
+        logger.debug("DIGEST: {}".format(hexlify(obj.digest)))
 
         return obj
 
     def asn1_serialize(self, encoder):
-        encryptedDigest = self.signer_engine.sign(self.digest)
+        logger.debug("SignerInfo: signing digest {}".format(hexlify(self.digest)))
+        encryptedDigest = self.signer_engine.sign(self.digest, digest_algorithm=self.digestAlgorithm, preshared=True)
         encoder.enter(asn1.Numbers.Sequence)
         encoder.write(self.version)
         self.issuerAndSerialNumber.asn1_serialize(encoder)
         self.digestAlgorithm.asn1_serialize(encoder)
         # Here we instruct asn1_serialize to encode it as a
         # [0] instead of a SET
-        self.authenticatedAttributes.asn1_serialize(encoder, tag=0)
+        self.authenticatedAttributes.asn1_serialize(encoder, implicit_tag=0)
         self.digestEncryptionAlgorithm.asn1_serialize(encoder)
         encoder.write(encryptedDigest, asn1.Numbers.OctetString)
         # TBC: unauthenticatedAtributes
@@ -1272,7 +1282,13 @@ class SignerInfo:
 # Digest ::= OCTET STRING
 # Often a DER encoding of another structure
 
-class DigestInfo:
+class DigestInfo(ASN1Data):
+
+    def __init__(self, digestAlgorithm=None, digest=None):
+        assert digestAlgorithm is None or isinstance(digestAlgorithm, AlgorithmIdentifier)
+        self.digestAlgorithm = digestAlgorithm
+        assert digest is None or isinstance(digest, bytes)
+        self.digest = digest
 
     @classmethod
     def parse(cls, decoder=None, data=None):
@@ -1301,6 +1317,8 @@ class DigestInfo:
 
     def asn1_serialize(self, encoder):
         encoder.enter(asn1.Numbers.Sequence)
+        self.digestAlgorithm.asn1_serialize(encoder)
+        encoder.write(self.digest, asn1.Numbers.OctetString)
         encoder.leave()
             
 class SignedDataBuilder:
